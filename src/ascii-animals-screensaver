@@ -1,0 +1,480 @@
+#!/usr/bin/python3
+"""ASCII Animals Screensaver: Linux launcher.
+
+    ascii-animals-screensaver             open the settings window
+    ascii-animals-screensaver show        start the screensaver now
+    ascii-animals-screensaver daemon      start it after some idle time (autostart)
+
+The animals themselves are a web page (web/index.html) shown in WebKitGTK.
+Idle detection talks to GNOME over D-Bus (org.gnome.Mutter.IdleMonitor).
+"""
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import random
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+__version__ = "1.0.0"
+
+APP_ID = "ascii-animals-screensaver"
+SELF = Path(__file__).resolve()
+
+# Keep in sync with DEFAULTS in web/screensaver.js.
+DEFAULT_IDLE_MINUTES = 3
+
+# After the screensaver opens, input is ignored for this long, so the click on
+# "Preview" (or a hand still on the mouse) doesn't close it straight away.
+GRACE_SECONDS = 1.5
+# How far the pointer has to move, in pixels, to close the screensaver.
+MOTION_THRESHOLD = 16
+# How often the daemon checks the idle time.
+POLL_SECONDS = 2
+
+BG_RGBA = (10 / 255, 12 / 255, 17 / 255, 1.0)  # --bg in web/screensaver.css
+
+
+def xdg_dir(var, fallback):
+    base = os.environ.get(var) or str(Path.home() / fallback)
+    return Path(base) / APP_ID
+
+
+CONFIG_FILE = xdg_dir("XDG_CONFIG_HOME", ".config") / "settings.json"
+LAST_ANIMAL_FILE = xdg_dir("XDG_STATE_HOME", ".local/state") / "last-animal"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP_ID}-{os.getuid()}") / APP_ID
+
+
+def log(msg):
+    print(f"{APP_ID}: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- files
+
+
+def read_settings():
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_settings(data):
+    write_atomic(CONFIG_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_last_animal():
+    try:
+        return LAST_ANIMAL_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def idle_delay_ms(settings):
+    try:
+        minutes = int(settings.get("idleMinutes", DEFAULT_IDLE_MINUTES))
+    except (TypeError, ValueError):
+        minutes = DEFAULT_IDLE_MINUTES
+    return max(1, min(minutes, 240)) * 60_000
+
+
+def web_dir():
+    """The web page: next to src/ when run from a checkout, else <prefix>/share."""
+    candidates = [
+        os.environ.get("ASCII_SAVER_WEB_DIR"),
+        SELF.parent.parent / "web",
+        SELF.parent.parent / "share" / APP_ID / "web",
+        Path("/usr/share") / APP_ID / "web",
+    ]
+    for cand in candidates:
+        if cand and (Path(cand) / "index.html").is_file():
+            return Path(cand)
+    sys.exit(f"{APP_ID}: cannot find the web files (index.html)")
+
+
+# ---------------------------------------------------------------- single instance
+
+
+def try_lock(name):
+    """Hold a lock for the life of the process. Returns None if taken."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(RUNTIME_DIR / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def is_running(name):
+    fd = try_lock(name)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def spawn_self(*args, reap=False):
+    """Start another copy of this program, detached from this one.
+
+    reap: let the GLib main loop collect it when it exits, for callers that
+    never wait on it themselves (otherwise it lingers as a zombie)."""
+    proc = subprocess.Popen(
+        [sys.executable, str(SELF), *args],
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if reap:
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, lambda *_: None)
+    return proc
+
+
+# ---------------------------------------------------------------- GNOME over D-Bus
+
+
+def dbus_call(bus, name, path, iface, method, args=None):
+    """Call a method, returning its first value, or None if it isn't there."""
+    try:
+        res = bus.call_sync(name, path, iface, method, args, None, Gio.DBusCallFlags.NO_AUTO_START, 1000, None)
+    except GLib.Error:
+        return None
+    values = res.unpack()
+    return values[0] if values else None
+
+
+def idle_time_ms(bus):
+    return dbus_call(
+        bus,
+        "org.gnome.Mutter.IdleMonitor",
+        "/org/gnome/Mutter/IdleMonitor/Core",
+        "org.gnome.Mutter.IdleMonitor",
+        "GetIdletime",
+    )
+
+
+def screen_shield_active(bus):
+    """True once GNOME has blanked or locked the screen."""
+    return bool(dbus_call(bus, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver", "GetActive"))
+
+
+def idle_inhibited(bus):
+    """True while an app asks to stay awake (a video playing, a presentation...)."""
+    IDLE = 8  # GsmInhibitorFlag
+    return bool(
+        dbus_call(
+            bus,
+            "org.gnome.SessionManager",
+            "/org/gnome/SessionManager",
+            "org.gnome.SessionManager",
+            "IsInhibited",
+            GLib.Variant("(u)", (IDLE,)),
+        )
+    )
+
+
+def gnome_idle_delay_seconds():
+    """When GNOME blanks the screen (0 = never), or None outside GNOME."""
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup("org.gnome.desktop.session", True) is None:
+        return None
+    return Gio.Settings.new("org.gnome.desktop.session").get_uint("idle-delay")
+
+
+# ---------------------------------------------------------------- daemon
+
+
+def run_daemon():
+    lock = try_lock("daemon")
+    if lock is None:
+        log("the idle watcher is already running")
+        return 0
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    state = {"armed": True, "child": None, "warned": False}
+
+    def tick():
+        child = state["child"]
+        if child is not None:
+            if child.poll() is None:
+                return GLib.SOURCE_CONTINUE
+            state["child"] = None
+
+        settings = read_settings()
+        if not settings.get("enabled", True):
+            return GLib.SOURCE_CONTINUE
+
+        idle = idle_time_ms(bus)
+        if idle is None:
+            if not state["warned"]:
+                log("can't read the idle time: this needs GNOME (org.gnome.Mutter.IdleMonitor)")
+                state["warned"] = True
+            return GLib.SOURCE_CONTINUE
+
+        if idle < idle_delay_ms(settings):
+            # the user came back: the next idle period may start the screensaver again
+            state["armed"] = True
+            return GLib.SOURCE_CONTINUE
+        if not state["armed"]:
+            return GLib.SOURCE_CONTINUE
+        if screen_shield_active(bus) or idle_inhibited(bus) or is_running("show"):
+            return GLib.SOURCE_CONTINUE
+
+        state["armed"] = False
+        log(f"idle for {idle // 1000}s, starting the screensaver")
+        state["child"] = spawn_self("show")
+        return GLib.SOURCE_CONTINUE
+
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    GLib.timeout_add_seconds(POLL_SECONDS, tick)
+    log(f"watching for idle time (version {__version__})")
+    loop.run()
+    return 0
+
+
+# ---------------------------------------------------------------- web views
+
+
+def load_gtk():
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("WebKit2", "4.1")
+    from gi.repository import Gdk, Gtk, WebKit2
+
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("ASCII Animals Screensaver")
+    Gtk.init(None)
+    return Gdk, Gtk, WebKit2
+
+
+def make_webview(WebKit2, Gdk, mode, host_extra, on_message):
+    host = {"mode": mode, "settings": read_settings(), **host_extra}
+    ucm = WebKit2.UserContentManager()
+    ucm.add_script(
+        WebKit2.UserScript.new(
+            f"window.SAVER_HOST = {json.dumps(host)};",
+            WebKit2.UserContentInjectedFrames.TOP_FRAME,
+            WebKit2.UserScriptInjectionTime.START,
+            None,
+            None,
+        )
+    )
+
+    def received(_ucm, result):
+        value = result.get_js_value() if hasattr(result, "get_js_value") else result
+        try:
+            msg = json.loads(value.to_string())
+        except ValueError:
+            return
+        if isinstance(msg, dict):
+            on_message(msg)
+
+    ucm.connect("script-message-received::saver", received)
+    ucm.register_script_message_handler("saver")
+
+    view = WebKit2.WebView(user_content_manager=ucm, is_ephemeral=True)
+    ws = view.get_settings()
+    ws.set_allow_file_access_from_file_urls(True)
+    debug = bool(os.environ.get("ASCII_SAVER_DEBUG"))
+    ws.set_enable_developer_extras(debug)
+    ws.set_enable_write_console_messages_to_stdout(debug)
+    view.set_background_color(Gdk.RGBA(*BG_RGBA))
+    if mode == "saver":
+        view.connect("context-menu", lambda *_: True)
+    view.load_uri((web_dir() / "index.html").as_uri())
+    return view
+
+
+# ---------------------------------------------------------------- screensaver
+
+
+def run_show(windowed=False, exit_after=0):
+    lock = try_lock("show")
+    if lock is None:
+        log("the screensaver is already on screen")
+        return 0
+
+    Gdk, Gtk, WebKit2 = load_gtk()
+    display = Gdk.Display.get_default()
+    started = time.monotonic()
+    seed = random.randrange(1 << 30)
+    last = read_last_animal()
+
+    quitting = []
+
+    def quit_(*_):
+        if not quitting:
+            quitting.append(True)
+            Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+
+    def armed():
+        return time.monotonic() - started > GRACE_SECONDS
+
+    def on_input(_widget, _event):
+        if armed():
+            quit_()
+        return True
+
+    motion_origin = {}
+
+    def on_motion(widget, event):
+        if not armed():
+            return False
+        origin = motion_origin.setdefault(widget, (event.x, event.y))
+        if math.hypot(event.x - origin[0], event.y - origin[1]) > MOTION_THRESHOLD:
+            quit_()
+        return False
+
+    def on_message(msg):
+        if msg.get("type") == "shown" and isinstance(msg.get("animal"), str):
+            try:
+                write_atomic(LAST_ANIMAL_FILE, msg["animal"][:40] + "\n")
+            except OSError:
+                pass
+
+    n_monitors = 1 if windowed else max(1, display.get_n_monitors())
+    primary = 0
+    for i in range(n_monitors):
+        mon = display.get_monitor(i)
+        if mon is not None and mon.is_primary():
+            primary = i
+
+    events = (
+        Gdk.EventMask.KEY_PRESS_MASK
+        | Gdk.EventMask.BUTTON_PRESS_MASK
+        | Gdk.EventMask.POINTER_MOTION_MASK
+        | Gdk.EventMask.SCROLL_MASK
+        | Gdk.EventMask.TOUCH_MASK
+    )
+    windows = []
+    for i in range(n_monitors):
+        win = Gtk.Window(title="ASCII Animals Screensaver")
+        view = make_webview(WebKit2, Gdk, "saver", {"seed": seed, "last": last, "primary": i == primary}, on_message)
+        win.add(view)
+        for widget in (win, view):
+            widget.add_events(events)
+            widget.connect("key-press-event", on_input)
+            widget.connect("button-press-event", on_input)
+            widget.connect("scroll-event", on_input)
+            widget.connect("touch-event", on_input)
+            widget.connect("motion-notify-event", on_motion)
+        win.connect("destroy", quit_)
+        if windowed:
+            win.set_default_size(1280, 800)
+        else:
+            win.fullscreen_on_monitor(win.get_screen(), i)
+        win.show_all()
+        if not windowed:
+            win.get_window().set_cursor(Gdk.Cursor.new_from_name(display, "none"))
+        windows.append(win)
+
+    # GNOME blanked or locked the screen: nobody is watching any more.
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.signal_subscribe(
+        "org.gnome.ScreenSaver",
+        "org.gnome.ScreenSaver",
+        "ActiveChanged",
+        "/org/gnome/ScreenSaver",
+        None,
+        Gio.DBusSignalFlags.NONE,
+        lambda _bus, _sender, _path, _iface, _signal, params: params.unpack()[0] and quit_(),
+    )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit_)
+    if exit_after > 0:
+        GLib.timeout_add(int(exit_after * 1000), quit_)
+
+    Gtk.main()
+    return 0
+
+
+# ---------------------------------------------------------------- settings window
+
+
+def run_settings():
+    lock = try_lock("settings")
+    if lock is None:
+        log("the settings window is already open")
+        return 0
+
+    Gdk, Gtk, WebKit2 = load_gtk()
+
+    # Right after installing there is no idle watcher until the next login:
+    # opening the settings is enough to get it going.
+    if not is_running("daemon"):
+        spawn_self("daemon", reap=True)
+
+    def on_message(msg):
+        kind = msg.get("type")
+        if kind == "save" and isinstance(msg.get("settings"), dict):
+            try:
+                write_settings(msg["settings"])
+            except OSError as err:
+                log(f"can't save the settings: {err}")
+        elif kind == "preview" and not is_running("show"):
+            spawn_self("show", reap=True)
+
+    win = Gtk.Window(title="ASCII Animals Screensaver")
+    win.set_icon_name(APP_ID)
+    win.set_default_size(1200, 780)
+    view = make_webview(WebKit2, Gdk, "settings", {"systemIdleSeconds": gnome_idle_delay_seconds()}, on_message)
+    win.add(view)
+    win.connect("destroy", lambda *_: Gtk.main_quit())
+    win.show_all()
+
+    def close():
+        win.destroy()
+        return GLib.SOURCE_REMOVE
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, close)
+    Gtk.main()
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=APP_ID, description="Pixel and ASCII animals behind a big clock.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.add_parser("settings", help="open the settings window (the default)")
+    show = sub.add_parser("show", help="start the screensaver now")
+    show.add_argument("--windowed", action="store_true", help="in a window instead of fullscreen (for testing)")
+    show.add_argument("--exit-after", type=float, default=0, metavar="SECONDS", help="close by itself after SECONDS")
+    sub.add_parser("daemon", help="start the screensaver after the idle delay (run at login)")
+    args = parser.parse_args(argv)
+
+    if args.command == "daemon":
+        return run_daemon()
+    if args.command == "show":
+        return run_show(windowed=args.windowed, exit_after=args.exit_after)
+    return run_settings()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

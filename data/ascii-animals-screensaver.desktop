@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=ASCII Animals Screensaver
+Name[fr]=Écran de veille ASCII Animals
+GenericName=Screensaver
+GenericName[fr]=Écran de veille
+Comment=Pixel and ASCII animals drifting behind a big clock when the computer is idle
+Comment[fr]=Des animaux en pixels et en ASCII derrière une grande horloge quand l'ordinateur est inactif
+Exec=ascii-animals-screensaver
+Icon=ascii-animals-screensaver
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=screensaver;screen saver;clock;animals;ascii;veille;horloge;animaux;
+StartupNotify=true
+StartupWMClass=ascii-animals-screensaver
+Actions=preview;
+
+[Desktop Action preview]
+Name=Preview the screensaver
+Name[fr]=Aperçu de l'écran de veille
+Exec=ascii-animals-screensaver show

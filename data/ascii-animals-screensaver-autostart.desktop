@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ASCII Animals Screensaver
+Name[fr]=Écran de veille ASCII Animals
+Comment=Starts the screensaver when the computer is idle
+Comment[fr]=Lance l'écran de veille quand l'ordinateur est inactif
+Exec=ascii-animals-screensaver daemon
+Icon=ascii-animals-screensaver
+Terminal=false
+NoDisplay=true
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true

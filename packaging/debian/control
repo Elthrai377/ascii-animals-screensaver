@@ -1,0 +1,17 @@
+Package: ascii-animals-screensaver
+Version: @VERSION@
+Section: x11
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-gi, gir1.2-glib-2.0, gir1.2-gtk-3.0, gir1.2-webkit2-4.1
+Recommends: gnome-shell
+Installed-Size: @SIZE@
+Maintainer: @MAINTAINER@
+Homepage: https://github.com/Elthrai377/ascii-animals-screensaver
+Description: screensaver with pixel and ASCII animals behind a big clock
+ Butterflies, koi, jellyfish, dragonflies, frogs, cranes and crabs drift
+ across the screen, drawn as tinted pixels and ASCII glyphs, behind a large
+ clock and the date.
+ .
+ A small idle watcher starts it after a few minutes without input (GNOME,
+ Wayland or X11). Any key, click or mouse movement closes it.
